@@ -6,6 +6,7 @@ const isPublicRoute = createRouteMatcher([
   "/sign-in(.*)",
   "/sign-up(.*)",
   "/offline(.*)",
+  "/api/trpc(.*)",
 ]);
 
 const isKnownRoute = createRouteMatcher([
@@ -16,6 +17,7 @@ const isKnownRoute = createRouteMatcher([
   "/org-selection(.*)",
   "/text-to-speech(.*)",
   "/voices(.*)",
+  "/test(.*)",
 ]);
 
 function isClerkDown(): boolean {
