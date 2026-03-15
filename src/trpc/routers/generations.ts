@@ -1,25 +1,20 @@
 import * as Sentry from "@sentry/nextjs";
 import { z } from "zod";
+import { polar } from "@/lib/polar";
+import { env } from "@/lib/env";
 import { TRPCError } from "@trpc/server";
+import { chatterbox } from "@/lib/chatterbox-client";
 import { prisma } from "@/lib/db";
 import { uploadAudio } from "@/lib/r2";
 import { TEXT_MAX_LENGTH } from "@/features/text-to-speech/data/constants";
 import { createTRPCRouter, orgProcedure } from "../init";
-import { chatterbox } from "@/lib/chatterbox-client";
 
 export const generationsRouter = createTRPCRouter({
   getById: orgProcedure
-    .input(
-      z.object({
-        id: z.string(),
-      }),
-    )
+    .input(z.object({ id: z.string() }))
     .query(async ({ input, ctx }) => {
       const generation = await prisma.generation.findUnique({
-        where: {
-          id: input.id,
-          orgId: ctx.orgId,
-        },
+        where: { id: input.id, orgId: ctx.orgId },
         omit: {
           orgId: true,
           r2ObjectKey: true,
@@ -27,9 +22,7 @@ export const generationsRouter = createTRPCRouter({
       });
 
       if (!generation) {
-        throw new TRPCError({
-          code: "NOT_FOUND",
-        });
+        throw new TRPCError({ code: "NOT_FOUND" });
       }
 
       return {
@@ -40,12 +33,8 @@ export const generationsRouter = createTRPCRouter({
 
   getAll: orgProcedure.query(async ({ ctx }) => {
     const generations = await prisma.generation.findMany({
-      where: {
-        orgId: ctx.orgId,
-      },
-      orderBy: {
-        createdAt: "desc",
-      },
+      where: { orgId: ctx.orgId },
+      orderBy: { createdAt: "desc" },
       omit: {
         orgId: true,
         r2ObjectKey: true,
@@ -67,16 +56,32 @@ export const generationsRouter = createTRPCRouter({
       }),
     )
     .mutation(async ({ input, ctx }) => {
+      // Check for active subscription before generation
+      try {
+        const customerState = await polar.customers.getStateExternal({
+          externalId: ctx.orgId,
+        });
+        const hasActiveSubscription =
+          (customerState.activeSubscriptions ?? []).length > 0;
+        if (!hasActiveSubscription) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "SUBSCRIPTION_REQUIRED",
+          });
+        }
+      } catch (err) {
+        if (err instanceof TRPCError) throw err;
+        // Customer doesn't exist in Polar yet -> no subscription
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "SUBSCRIPTION_REQUIRED",
+        });
+      }
+
       const voice = await prisma.voice.findUnique({
         where: {
           id: input.voiceId,
-          OR: [
-            { variant: "SYSTEM" },
-            {
-              variant: "CUSTOM",
-              orgId: ctx.orgId,
-            },
-          ],
+          OR: [{ variant: "SYSTEM" }, { variant: "CUSTOM", orgId: ctx.orgId }],
         },
         select: {
           id: true,
@@ -95,7 +100,7 @@ export const generationsRouter = createTRPCRouter({
       if (!voice.r2ObjectKey) {
         throw new TRPCError({
           code: "PRECONDITION_FAILED",
-          message: "Voice audio is not available",
+          message: "Voice audio not available",
         });
       }
 
@@ -128,7 +133,7 @@ export const generationsRouter = createTRPCRouter({
       if (!(data instanceof ArrayBuffer)) {
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
-          message: "Invalid Audio Response",
+          message: "Invalid audio response",
         });
       }
 
@@ -156,11 +161,7 @@ export const generationsRouter = createTRPCRouter({
         generationId = generation.id;
         r2ObjectKey = `generations/orgs/${ctx.orgId}/${generation.id}`;
 
-        await uploadAudio({
-          buffer,
-          key: r2ObjectKey,
-          contentType: "audio/wav",
-        });
+        await uploadAudio({ buffer, key: r2ObjectKey });
 
         await prisma.generation.update({
           where: {
@@ -170,6 +171,7 @@ export const generationsRouter = createTRPCRouter({
             r2ObjectKey,
           },
         });
+
         Sentry.logger.info("Audio generated", {
           orgId: ctx.orgId,
           generationId: generation.id,
@@ -202,6 +204,22 @@ export const generationsRouter = createTRPCRouter({
           message: "Failed to store generated audio",
         });
       }
+
+      // Ingest usage event to Polar (fire-and-forget, don't block response)
+      polar.events
+        .ingest({
+          events: [
+            {
+              name: env.POLAR_METER_TTS_GENERATION,
+              externalCustomerId: ctx.orgId,
+              metadata: { [env.POLAR_METER_TTS_PROPERTY]: input.text.length },
+              timestamp: new Date(),
+            },
+          ],
+        })
+        .catch(() => {
+          // Silently fail - don't break the user experience for metering errors
+        });
 
       return {
         id: generationId,
